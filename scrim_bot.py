@@ -8,7 +8,7 @@ import os
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 BOT_TOKEN  = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
 HOST_TZ    = "Australia/Sydney"   # The "home" timezone the time slots are anchored to
-POLL_HOUR  = 0                    # 8 AM (in HOST_TZ) — when the daily poll is posted
+POLL_HOUR  = 0                    # 12 AM (in HOST_TZ) — when the daily poll is posted
 POLL_MIN   = 0
 CONFIG_FILE = "channels.json"
 
