@@ -11,8 +11,13 @@ BOT_TOKEN  = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
 HOST_TZ    = "Australia/Sydney"   # The "home" timezone the time slots are anchored to
 POLL_HOUR  = 0                    # 0 = midnight (in HOST_TZ) — when the daily poll is posted
 POLL_MIN   = 0
-CONFIG_FILE = "channels.json"
-LAST_POLL_FILE = "last_poll.json"  # Tracks the last date a poll was sent (per guild)
+
+# Persistent storage location
+# /data is a Railway Volume that survives redeploys
+# Falls back to the local folder if /data doesn't exist (for local testing)
+DATA_DIR = "/data" if os.path.isdir("/data") else "."
+CONFIG_FILE = os.path.join(DATA_DIR, "channels.json")
+LAST_POLL_FILE = os.path.join(DATA_DIR, "last_poll.json")
 
 # Time slots in HOST_TZ (24-hour format: hour, minute)
 SLOT_TIMES = [
@@ -136,6 +141,8 @@ async def check_missed_polls():
 
     channels = load_channels()
     last_polls = load_last_poll_dates()
+    print(f"[CATCH-UP] Today is {today_str}. Found {len(channels)} configured server(s).")
+
     missed_any = False
 
     for guild_id, channel_id in channels.items():
@@ -154,7 +161,7 @@ async def check_missed_polls():
             else:
                 print(f"[WARN] Channel {channel_id} not found for guild {guild_id}")
 
-    if not missed_any:
+    if not missed_any and channels:
         print("[CATCH-UP] All servers already have today's poll. No catch-up needed.")
 
 
@@ -253,6 +260,7 @@ async def on_command_error(ctx, error):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} — serving {len(bot.guilds)} servers")
+    print(f"Data directory: {DATA_DIR}")
     print(f"Daily poll scheduled for {POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}")
 
 
