@@ -12,6 +12,7 @@ HOST_TZ    = "Australia/Sydney"   # The "home" timezone the time slots are ancho
 POLL_HOUR  = 0                    # 0 = midnight (in HOST_TZ) — when the daily poll is posted
 POLL_MIN   = 0
 CONFIG_FILE = "channels.json"
+LAST_POLL_FILE = "last_poll.json"  # Tracks the last date a poll was sent (per guild)
 
 # Time slots in HOST_TZ (24-hour format: hour, minute)
 SLOT_TIMES = [
@@ -41,6 +42,23 @@ def load_channels():
 def save_channels(data):
     with open(CONFIG_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+def load_last_poll_dates():
+    if not os.path.exists(LAST_POLL_FILE):
+        return {}
+    with open(LAST_POLL_FILE, "r") as f:
+        return json.load(f)
+
+def save_last_poll_dates(data):
+    with open(LAST_POLL_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def mark_poll_sent(guild_id):
+    """Record today's date (in HOST_TZ) as the last poll date for this guild."""
+    dates = load_last_poll_dates()
+    today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
+    dates[str(guild_id)] = today
+    save_last_poll_dates(dates)
 
 
 # ─── BUILD TIME SLOTS WITH DYNAMIC TIMESTAMPS ─────────────────────────────────
@@ -91,10 +109,63 @@ async def post_poll(channel):
         await msg.add_reaction(emoji)
 
 
+async def post_polls_to_all_servers(reason="scheduled"):
+    """Posts to every configured server and records the date."""
+    channels = load_channels()
+    today_str = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
+
+    for guild_id, channel_id in channels.items():
+        channel = bot.get_channel(int(channel_id))
+        if channel:
+            try:
+                await post_poll(channel)
+                mark_poll_sent(guild_id)
+                print(f"[OK] Posted {reason} poll in guild {guild_id} for {today_str}")
+            except Exception as e:
+                print(f"[ERROR] Failed to post in {channel_id}: {e}")
+        else:
+            print(f"[WARN] Channel {channel_id} not found for guild {guild_id}")
+
+
+# ─── CATCH-UP CHECK ───────────────────────────────────────────────────────────
+async def check_missed_polls():
+    """On startup: if today's poll hasn't been sent yet for a guild, send it now."""
+    tz = pytz.timezone(HOST_TZ)
+    now = datetime.datetime.now(tz)
+    today_str = now.strftime("%Y-%m-%d")
+
+    channels = load_channels()
+    last_polls = load_last_poll_dates()
+    missed_any = False
+
+    for guild_id, channel_id in channels.items():
+        last_date = last_polls.get(str(guild_id))
+        if last_date != today_str:
+            # Haven't posted today yet — catch up
+            channel = bot.get_channel(int(channel_id))
+            if channel:
+                try:
+                    await post_poll(channel)
+                    mark_poll_sent(guild_id)
+                    print(f"[CATCH-UP] Posted missed poll for guild {guild_id} (last: {last_date or 'never'})")
+                    missed_any = True
+                except Exception as e:
+                    print(f"[ERROR] Catch-up failed for {channel_id}: {e}")
+            else:
+                print(f"[WARN] Channel {channel_id} not found for guild {guild_id}")
+
+    if not missed_any:
+        print("[CATCH-UP] All servers already have today's poll. No catch-up needed.")
+
+
 # ─── DAILY SCHEDULED POLL (manual sleep loop — avoids clock drift bug) ───────
 async def daily_poll_loop():
     """Sleeps until next POLL_HOUR:POLL_MIN in HOST_TZ, then posts polls."""
     await bot.wait_until_ready()
+
+    # First: check for missed polls
+    await check_missed_polls()
+
     tz = pytz.timezone(HOST_TZ)
 
     while not bot.is_closed():
@@ -115,18 +186,8 @@ async def daily_poll_loop():
         except asyncio.CancelledError:
             break
 
-        # Time to post! Load channels fresh each time so new servers get added
-        channels = load_channels()
-        for guild_id, channel_id in channels.items():
-            channel = bot.get_channel(int(channel_id))
-            if channel:
-                try:
-                    await post_poll(channel)
-                    print(f"[OK] Posted poll in guild {guild_id}")
-                except Exception as e:
-                    print(f"[ERROR] Failed to post in {channel_id}: {e}")
-            else:
-                print(f"[WARN] Channel {channel_id} not found for guild {guild_id}")
+        # Time to post the scheduled poll
+        await post_polls_to_all_servers(reason="scheduled")
 
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
@@ -155,6 +216,7 @@ async def unsetchannel(ctx):
 async def scrim(ctx):
     """Manually trigger the poll right now."""
     await post_poll(ctx.channel)
+    mark_poll_sent(ctx.guild.id)  # Count manual polls toward today's quota
     try:
         await ctx.message.delete()
     except discord.Forbidden:
