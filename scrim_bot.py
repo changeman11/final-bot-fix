@@ -1,14 +1,15 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 import datetime
 import pytz
 import json
 import os
+import asyncio
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 BOT_TOKEN  = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
 HOST_TZ    = "Australia/Sydney"   # The "home" timezone the time slots are anchored to
-POLL_HOUR  = 0                    # 12 AM (in HOST_TZ) — when the daily poll is posted
+POLL_HOUR  = 0                    # 0 = midnight (in HOST_TZ) — when the daily poll is posted
 POLL_MIN   = 0
 CONFIG_FILE = "channels.json"
 
@@ -90,19 +91,42 @@ async def post_poll(channel):
         await msg.add_reaction(emoji)
 
 
-# ─── DAILY SCHEDULED POLL ─────────────────────────────────────────────────────
-@tasks.loop(time=datetime.time(hour=POLL_HOUR, minute=POLL_MIN, tzinfo=pytz.timezone(HOST_TZ)))
-async def daily_poll():
-    channels = load_channels()
-    for guild_id, channel_id in channels.items():
-        channel = bot.get_channel(int(channel_id))
-        if channel:
-            try:
-                await post_poll(channel)
-            except Exception as e:
-                print(f"[ERROR] Failed to post in {channel_id}: {e}")
-        else:
-            print(f"[WARN] Channel {channel_id} not found for guild {guild_id}")
+# ─── DAILY SCHEDULED POLL (manual sleep loop — avoids clock drift bug) ───────
+async def daily_poll_loop():
+    """Sleeps until next POLL_HOUR:POLL_MIN in HOST_TZ, then posts polls."""
+    await bot.wait_until_ready()
+    tz = pytz.timezone(HOST_TZ)
+
+    while not bot.is_closed():
+        now = datetime.datetime.now(tz)
+        # Build today's target time
+        target = tz.localize(datetime.datetime(
+            now.year, now.month, now.day, POLL_HOUR, POLL_MIN
+        ))
+        # If target already passed today, schedule for tomorrow
+        if target <= now:
+            target += datetime.timedelta(days=1)
+
+        wait_seconds = (target - now).total_seconds()
+        print(f"[SCHEDULER] Next poll at {target.isoformat()} (in {wait_seconds:.0f}s)")
+
+        try:
+            await asyncio.sleep(wait_seconds)
+        except asyncio.CancelledError:
+            break
+
+        # Time to post! Load channels fresh each time so new servers get added
+        channels = load_channels()
+        for guild_id, channel_id in channels.items():
+            channel = bot.get_channel(int(channel_id))
+            if channel:
+                try:
+                    await post_poll(channel)
+                    print(f"[OK] Posted poll in guild {guild_id}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to post in {channel_id}: {e}")
+            else:
+                print(f"[WARN] Channel {channel_id} not found for guild {guild_id}")
 
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
@@ -113,7 +137,7 @@ async def setchannel(ctx):
     channels = load_channels()
     channels[str(ctx.guild.id)] = str(ctx.channel.id)
     save_channels(channels)
-    await ctx.send(f"✅ Daily scrim polls will now post in {ctx.channel.mention} at {POLL_HOUR}:00 {HOST_TZ}.")
+    await ctx.send(f"✅ Daily scrim polls will now post in {ctx.channel.mention} at {POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}.")
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
@@ -145,7 +169,7 @@ async def scrimhelp(ctx):
             f"**!unsetchannel** — Stop daily polls (admin only)\n"
             f"**!scrim** — Post a poll right now\n"
             f"**!scrimhelp** — Show this message\n\n"
-            f"Daily polls auto-post at **{POLL_HOUR}:00 {HOST_TZ}**.\n"
+            f"Daily polls auto-post at **{POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}**.\n"
             f"Times in the poll display in **each player's local timezone**."
         ),
         color=discord.Color.blurple(),
@@ -168,8 +192,13 @@ async def on_command_error(ctx, error):
 async def on_ready():
     print(f"Logged in as {bot.user} — serving {len(bot.guilds)} servers")
     print(f"Daily poll scheduled for {POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}")
-    if not daily_poll.is_running():
-        daily_poll.start()
+
+
+# Start the scheduler as a background task (replaces the buggy tasks.loop)
+async def setup_hook():
+    bot.loop.create_task(daily_poll_loop())
+
+bot.setup_hook = setup_hook
 
 
 bot.run(BOT_TOKEN)
