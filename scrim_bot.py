@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import datetime
 import pytz
 import json
@@ -23,7 +24,7 @@ LAST_POLL_FILE    = os.path.join(DATA_DIR, "last_poll.json")
 POLL_MSGS_FILE    = os.path.join(DATA_DIR, "poll_messages.json")
 BOARD_MSGS_FILE   = os.path.join(DATA_DIR, "board_messages.json")
 MATCHMAKING_FILE  = os.path.join(DATA_DIR, "matchmaking.json")
-PINGS_FILE        = os.path.join(DATA_DIR, "pings.json")  # per-guild ping config
+PINGS_FILE        = os.path.join(DATA_DIR, "pings.json")
 
 # Time slots in HOST_TZ (24-hour format: hour, minute)
 SLOT_TIMES = [
@@ -86,11 +87,9 @@ def save_pings(d):               _save_json(PINGS_FILE, d)
 
 def is_matchmaking_enabled(guild_id):
     """Default ON — only OFF if explicitly disabled (opt-out model)."""
-    settings = load_matchmaking_settings()
-    return settings.get(str(guild_id), True)
+    return load_matchmaking_settings().get(str(guild_id), True)
 
 def get_ping_for(guild_id):
-    """Return the ping string set for a guild, or None."""
     return load_pings().get(str(guild_id))
 
 def mark_poll_sent(guild_id):
@@ -102,21 +101,13 @@ def mark_poll_sent(guild_id):
 def record_poll_message(guild_id, channel_id, message_id):
     msgs = load_poll_messages()
     today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
-    msgs[str(guild_id)] = {
-        "channel_id": str(channel_id),
-        "message_id": str(message_id),
-        "date": today,
-    }
+    msgs[str(guild_id)] = {"channel_id": str(channel_id), "message_id": str(message_id), "date": today}
     save_poll_messages(msgs)
 
 def record_board_message(guild_id, channel_id, message_id):
     msgs = load_board_messages()
     today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
-    msgs[str(guild_id)] = {
-        "channel_id": str(channel_id),
-        "message_id": str(message_id),
-        "date": today,
-    }
+    msgs[str(guild_id)] = {"channel_id": str(channel_id), "message_id": str(message_id), "date": today}
     save_board_messages(msgs)
 
 
@@ -152,11 +143,8 @@ async def post_poll(channel):
     )
     embed.set_footer(text="React to ALL times you're available!")
 
-    # Get the ping (if any) — gets sent ABOVE the embed so it actually notifies
     ping = get_ping_for(channel.guild.id)
     content = ping if ping else None
-
-    # AllowedMentions controls what can actually trigger notifications
     allowed = discord.AllowedMentions(everyone=True, roles=True, users=False)
 
     msg = await channel.send(content=content, embed=embed, allowed_mentions=allowed)
@@ -165,7 +153,6 @@ async def post_poll(channel):
 
     record_poll_message(channel.guild.id, channel.id, msg.id)
 
-    # Always post the availability board right after the poll (consolidated)
     if is_matchmaking_enabled(channel.guild.id):
         await post_or_update_board(channel.guild.id, force_new=True)
 
@@ -238,7 +225,6 @@ async def daily_poll_loop():
 
 # ─── AVAILABILITY BOARD ───────────────────────────────────────────────────────
 async def get_full_team_slots(guild_id):
-    """Return emojis for which this guild has TEAM_SIZE+ humans reacted (bot's react = +1)."""
     poll_messages = load_poll_messages()
     today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
     info = poll_messages.get(str(guild_id))
@@ -305,7 +291,7 @@ async def build_board_embed(viewer_guild_id):
 
     lines.append("")
     lines.append("_DM the team's captain or your contact in their Discord to set up a match._")
-    lines.append("_Use `!matchmaking off` to hide your team from this board._")
+    lines.append("_Use `/matchmaking off` to hide your team from this board._")
 
     embed = discord.Embed(
         title=f"📋 Live Scrim Availability — {today}",
@@ -317,7 +303,6 @@ async def build_board_embed(viewer_guild_id):
 
 
 async def post_or_update_board(guild_id, force_new=False):
-    """Post a new board (force_new=True) or edit the existing one."""
     if not is_matchmaking_enabled(guild_id):
         return
 
@@ -335,7 +320,6 @@ async def post_or_update_board(guild_id, force_new=False):
     boards = load_board_messages()
     info = boards.get(str(guild_id))
 
-    # Edit existing board if it's from today and we're not forcing a new one
     if info and info.get("date") == today and not force_new:
         try:
             board_channel = bot.get_channel(int(info["channel_id"]))
@@ -344,7 +328,7 @@ async def post_or_update_board(guild_id, force_new=False):
                 await msg.edit(embed=embed)
                 return
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass  # fall through and post a new one
+            pass
 
     try:
         msg = await channel.send(embed=embed)
@@ -397,20 +381,21 @@ async def on_raw_reaction_remove(payload):
     await update_all_boards()
 
 
-# ─── COMMANDS ─────────────────────────────────────────────────────────────────
-@bot.command()
+# ─── HYBRID COMMANDS (both ! and / work) ──────────────────────────────────────
+# hybrid_command = works as !command (prefix) AND /command (slash)
+
+@bot.hybrid_command(name="setchannel", description="Set the current channel for daily scrim polls")
 @commands.has_permissions(manage_guild=True)
 async def setchannel(ctx):
-    """Set the current channel as this server's scrim poll channel."""
     channels = load_channels()
     channels[str(ctx.guild.id)] = str(ctx.channel.id)
     save_channels(channels)
     await ctx.send(f"✅ Daily scrim polls will now post in {ctx.channel.mention} at {POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}.")
 
-@bot.command()
+
+@bot.hybrid_command(name="unsetchannel", description="Stop daily scrim polls in this server")
 @commands.has_permissions(manage_guild=True)
 async def unsetchannel(ctx):
-    """Stop daily polls in this server."""
     channels = load_channels()
     if str(ctx.guild.id) in channels:
         del channels[str(ctx.guild.id)]
@@ -419,46 +404,49 @@ async def unsetchannel(ctx):
     else:
         await ctx.send("This server doesn't have a poll channel set.")
 
-@bot.command()
+
+@bot.hybrid_command(name="scrim", description="Post a scrim availability poll right now")
 async def scrim(ctx):
-    """Manually trigger the poll right now."""
+    await ctx.defer()  # acknowledge the slash command (avoids 'interaction failed')
     await post_poll(ctx.channel)
     mark_poll_sent(ctx.guild.id)
-    try:
-        await ctx.message.delete()
-    except discord.Forbidden:
-        pass
+    await ctx.send("✅ Poll posted!", ephemeral=True)
+    # Try to delete the original ! message if it was a prefix command
+    if ctx.message and ctx.message.author != bot.user:
+        try:
+            await ctx.message.delete()
+        except (discord.Forbidden, discord.NotFound):
+            pass
 
-@bot.command()
+
+@bot.hybrid_command(name="setping", description="Set a ping (@everyone, @here, or @Role) above each daily poll")
+@app_commands.describe(ping="The ping to add: @everyone, @here, or a role mention")
 @commands.has_permissions(manage_guild=True)
 async def setping(ctx, *, ping: str = None):
-    """Set a ping (@everyone, @here, or @Role) to appear above each daily poll."""
     if ping is None:
         await ctx.send(
-            "Usage: `!setping @everyone` or `!setping @here` or `!setping @YourRole`\n"
-            "Use `!unsetping` to remove it."
+            "Usage: `/setping @everyone` or `/setping @here` or `/setping @YourRole`\n"
+            "Use `/unsetping` to remove it.",
+            ephemeral=True,
         )
         return
 
     ping = ping.strip()
-
-    # Validate: must be @everyone, @here, or a role mention <@&ROLE_ID>
     valid = False
     if ping in ("@everyone", "@here"):
         valid = True
     elif re.fullmatch(r"<@&\d+>", ping):
-        # It's a proper role mention
         role_id = int(ping[3:-1])
-        role = ctx.guild.get_role(role_id)
-        if role:
+        if ctx.guild.get_role(role_id):
             valid = True
 
     if not valid:
         await ctx.send(
             "❌ That doesn't look like a valid ping. Use:\n"
-            "• `!setping @everyone`\n"
-            "• `!setping @here`\n"
-            "• `!setping @YourRole` (the role must exist in this server)"
+            "• `/setping @everyone`\n"
+            "• `/setping @here`\n"
+            "• `/setping @YourRole` (the role must exist in this server)",
+            ephemeral=True,
         )
         return
 
@@ -467,13 +455,13 @@ async def setping(ctx, *, ping: str = None):
     save_pings(pings)
     await ctx.send(
         f"✅ Daily polls will now ping {ping} above the message.",
-        allowed_mentions=discord.AllowedMentions.none()  # don't actually ping during setup
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
-@bot.command()
+
+@bot.hybrid_command(name="unsetping", description="Remove the ping above daily polls")
 @commands.has_permissions(manage_guild=True)
 async def unsetping(ctx):
-    """Remove the ping that appears above each daily poll."""
     pings = load_pings()
     gid = str(ctx.guild.id)
     if gid in pings:
@@ -483,10 +471,16 @@ async def unsetping(ctx):
     else:
         await ctx.send("This server doesn't have a ping set.")
 
-@bot.command()
+
+@bot.hybrid_command(name="matchmaking", description="Enable/disable cross-server availability board")
+@app_commands.describe(mode="on, off, or status")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+    app_commands.Choice(name="status", value="status"),
+])
 @commands.has_permissions(manage_guild=True)
 async def matchmaking(ctx, mode: str = None):
-    """Enable/disable cross-server availability board for this server."""
     settings = load_matchmaking_settings()
     gid = str(ctx.guild.id)
 
@@ -495,7 +489,7 @@ async def matchmaking(ctx, mode: str = None):
         state = "ON ✅" if enabled else "OFF ❌"
         await ctx.send(
             f"**Matchmaking is currently {state}** for this server.\n"
-            f"Use `!matchmaking on` or `!matchmaking off` to change."
+            f"Use `/matchmaking on` or `/matchmaking off` to change."
         )
         return
 
@@ -510,22 +504,24 @@ async def matchmaking(ctx, mode: str = None):
         save_matchmaking_settings(settings)
         await ctx.send("❌ Matchmaking **disabled**. Your team is now hidden from other servers' boards.")
     else:
-        await ctx.send("Usage: `!matchmaking on`, `!matchmaking off`, or `!matchmaking status`")
+        await ctx.send("Usage: `/matchmaking on`, `/matchmaking off`, or `/matchmaking status`")
 
-@bot.command()
+
+@bot.hybrid_command(name="scrimhelp", description="Show all available scrim bot commands")
 async def scrimhelp(ctx):
     embed = discord.Embed(
         title="🎮 Scrim Bot Commands",
         description=(
+            "All commands work as both `/command` (slash) and `!command` (prefix).\n\n"
             "**Setup (admin only):**\n"
-            "• `!setchannel` — Use the current channel for daily polls\n"
-            "• `!unsetchannel` — Stop daily polls\n"
-            "• `!setping @Role` — Add a ping above each poll (`@everyone`, `@here`, or `@Role`)\n"
-            "• `!unsetping` — Remove the ping\n"
-            "• `!matchmaking on/off/status` — Toggle cross-server availability board\n\n"
+            "• `/setchannel` — Use the current channel for daily polls\n"
+            "• `/unsetchannel` — Stop daily polls\n"
+            "• `/setping @Role` — Add a ping above each poll (`@everyone`, `@here`, or `@Role`)\n"
+            "• `/unsetping` — Remove the ping\n"
+            "• `/matchmaking on/off/status` — Toggle cross-server availability board\n\n"
             "**Anyone:**\n"
-            "• `!scrim` — Post a poll right now\n"
-            "• `!scrimhelp` — Show this message\n\n"
+            "• `/scrim` — Post a poll right now\n"
+            "• `/scrimhelp` — Show this message\n\n"
             f"📅 Daily polls auto-post at **{POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}**.\n"
             "🌍 Times in the poll show in **each player's local timezone**.\n"
             f"📋 When your team has **{TEAM_SIZE}+ reactions** on a slot, your server name "
@@ -547,6 +543,24 @@ async def on_command_error(ctx, error):
         print(f"[ERROR] {error}")
 
 
+@bot.tree.error
+async def on_app_command_error(interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You need the **Manage Server** permission to use this command.",
+            ephemeral=True,
+        )
+    else:
+        print(f"[SLASH ERROR] {error}")
+        try:
+            await interaction.response.send_message(
+                "❌ Something went wrong. Try again in a moment.",
+                ephemeral=True,
+            )
+        except discord.InteractionResponded:
+            pass
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} — serving {len(bot.guilds)} servers")
@@ -554,9 +568,15 @@ async def on_ready():
     print(f"Daily poll scheduled for {POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}")
 
 
-# Start the scheduler as a background task
+# Start the scheduler & sync slash commands
 async def setup_hook():
     bot.loop.create_task(daily_poll_loop())
+    try:
+        synced = await bot.tree.sync()
+        print(f"[SLASH] Synced {len(synced)} slash command(s) globally.")
+        print("[SLASH] Note: global slash commands can take up to 1 hour to appear in all servers.")
+    except Exception as e:
+        print(f"[SLASH] Failed to sync slash commands: {e}")
 
 bot.setup_hook = setup_hook
 
