@@ -10,14 +10,12 @@ import re
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 BOT_TOKEN  = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
-HOST_TZ    = "Australia/Sydney"   # The "home" timezone the time slots are anchored to
-POLL_HOUR  = 0                    # 0 = midnight (in HOST_TZ) — when the daily poll is posted
+HOST_TZ    = "Australia/Sydney"
+POLL_HOUR  = 0                    # 0 = midnight Sydney time
 POLL_MIN   = 0
-TEAM_SIZE  = 5                    # Players needed for a full team (bot's own react not counted)
+TEAM_SIZE  = 5
+MAX_FILL_REACTIONS = 20           # Discord's per-message reaction limit
 
-# Persistent storage location
-# /data is a Railway Volume that survives redeploys
-# Falls back to the local folder if /data doesn't exist (for local testing)
 DATA_DIR = "/data" if os.path.isdir("/data") else "."
 CONFIG_FILE       = os.path.join(DATA_DIR, "channels.json")
 LAST_POLL_FILE    = os.path.join(DATA_DIR, "last_poll.json")
@@ -25,6 +23,8 @@ POLL_MSGS_FILE    = os.path.join(DATA_DIR, "poll_messages.json")
 BOARD_MSGS_FILE   = os.path.join(DATA_DIR, "board_messages.json")
 MATCHMAKING_FILE  = os.path.join(DATA_DIR, "matchmaking.json")
 PINGS_FILE        = os.path.join(DATA_DIR, "pings.json")
+CLAIMS_FILE       = os.path.join(DATA_DIR, "claims.json")
+FILL_REACTS_FILE  = os.path.join(DATA_DIR, "fill_reactions.json")  # maps board emoji -> fill info per guild
 
 # Time slots in HOST_TZ (24-hour format: hour, minute)
 SLOT_TIMES = [
@@ -37,10 +37,16 @@ SLOT_TIMES = [
 ]
 
 EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟", "🅰️"]
+FILL_EMOJI = "✅"  # players react with this on the poll to flag themselves as a fill
+
+# Regional indicator emojis A-T (20 of them) used as "claim" buttons on the board
+CLAIM_EMOJIS = [
+    "🇦", "🇧", "🇨", "🇩", "🇪", "🇫", "🇬", "🇭", "🇮", "🇯",
+    "🇰", "🇱", "🇲", "🇳", "🇴", "🇵", "🇶", "🇷", "🇸", "🇹",
+]
 
 
 def emoji_to_label(emoji):
-    """Convert reaction emoji to readable time string like '8:00 PM'."""
     if emoji not in EMOJIS:
         return emoji
     idx = EMOJIS.index(emoji)
@@ -50,6 +56,27 @@ def emoji_to_label(emoji):
     if h12 == 0:
         h12 = 12
     return f"{h12}:{minute:02d} {period}"
+
+
+def label_to_emoji(label):
+    """Convert a string like '8pm' or '8:30 PM' to the matching slot emoji. Returns None if no match."""
+    if not label:
+        return None
+    s = label.strip().lower().replace(" ", "")
+    m = re.match(r"^(\d{1,2})(?::?(\d{2}))?\s*(am|pm)?$", s)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2)) if m.group(2) else 0
+    ampm = m.group(3)
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    for emoji, (h, mm) in zip(EMOJIS, SLOT_TIMES):
+        if h == hour and mm == minute:
+            return emoji
+    return None
 # ───────────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -84,31 +111,84 @@ def load_matchmaking_settings(): return _load_json(MATCHMAKING_FILE, {})
 def save_matchmaking_settings(d):_save_json(MATCHMAKING_FILE, d)
 def load_pings():                return _load_json(PINGS_FILE, {})
 def save_pings(d):               _save_json(PINGS_FILE, d)
+def load_claims():               return _load_json(CLAIMS_FILE, {})
+def save_claims(d):              _save_json(CLAIMS_FILE, d)
+def load_fill_reacts():          return _load_json(FILL_REACTS_FILE, {})
+def save_fill_reacts(d):         _save_json(FILL_REACTS_FILE, d)
+
 
 def is_matchmaking_enabled(guild_id):
-    """Default ON — only OFF if explicitly disabled (opt-out model)."""
     return load_matchmaking_settings().get(str(guild_id), True)
 
 def get_ping_for(guild_id):
     return load_pings().get(str(guild_id))
 
+def today_str():
+    return datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
+
 def mark_poll_sent(guild_id):
     dates = load_last_poll_dates()
-    today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
-    dates[str(guild_id)] = today
+    dates[str(guild_id)] = today_str()
     save_last_poll_dates(dates)
+
+def has_poll_today(guild_id):
+    """Returns True if this guild already had a poll posted today."""
+    return load_last_poll_dates().get(str(guild_id)) == today_str()
 
 def record_poll_message(guild_id, channel_id, message_id):
     msgs = load_poll_messages()
-    today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
-    msgs[str(guild_id)] = {"channel_id": str(channel_id), "message_id": str(message_id), "date": today}
+    msgs[str(guild_id)] = {"channel_id": str(channel_id), "message_id": str(message_id), "date": today_str()}
     save_poll_messages(msgs)
 
 def record_board_message(guild_id, channel_id, message_id):
     msgs = load_board_messages()
-    today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
-    msgs[str(guild_id)] = {"channel_id": str(channel_id), "message_id": str(message_id), "date": today}
+    msgs[str(guild_id)] = {"channel_id": str(channel_id), "message_id": str(message_id), "date": today_str()}
     save_board_messages(msgs)
+
+
+# ─── CLAIMS ───────────────────────────────────────────────────────────────────
+# claims.json structure (keyed by date so old data clears naturally):
+# {
+#   "2026-05-01": {
+#     "<slot_emoji>": [
+#       {"fill_user_id", "fill_user_name", "fill_home_guild_id",
+#        "claimed_by_guild_id", "claimed_by_guild_name"}
+#     ]
+#   }
+# }
+
+def get_today_claims():
+    return load_claims().get(today_str(), {})
+
+def save_today_claims(today_claims):
+    # Prune old days — only keep today's
+    save_claims({today_str(): today_claims})
+
+def add_claim(slot_emoji, fill_user_id, fill_user_name, fill_home_guild_id, claiming_guild_id, claiming_guild_name):
+    today_claims = get_today_claims()
+    today_claims.setdefault(slot_emoji, []).append({
+        "fill_user_id": str(fill_user_id),
+        "fill_user_name": fill_user_name,
+        "fill_home_guild_id": str(fill_home_guild_id),
+        "claimed_by_guild_id": str(claiming_guild_id),
+        "claimed_by_guild_name": claiming_guild_name,
+    })
+    save_today_claims(today_claims)
+
+def remove_claim(slot_emoji, fill_user_id, claiming_guild_id):
+    today_claims = get_today_claims()
+    arr = today_claims.get(slot_emoji, [])
+    arr = [c for c in arr
+           if not (c["fill_user_id"] == str(fill_user_id) and c["claimed_by_guild_id"] == str(claiming_guild_id))]
+    today_claims[slot_emoji] = arr
+    save_today_claims(today_claims)
+
+def is_already_claimed_for_slot(slot_emoji, fill_user_id):
+    """Returns the existing claim dict if this fill is already claimed by ANY team for this slot today."""
+    for c in get_today_claims().get(slot_emoji, []):
+        if c["fill_user_id"] == str(fill_user_id):
+            return c
+    return None
 
 
 # ─── BUILD TIME SLOTS WITH DYNAMIC TIMESTAMPS ─────────────────────────────────
@@ -137,7 +217,9 @@ async def post_poll(channel):
         description=(
             "React with the time(s) you're **free to scrim** tonight.\n"
             "Times shown in **your local timezone** automatically.\n\n"
-            + poll_body
+            f"{poll_body}\n\n"
+            f"{FILL_EMOJI} **= I'm available as a FILL** for any team\n"
+            "_(react ✅ AND time slot(s) — your home team still gets priority)_"
         ),
         color=discord.Color.blurple(),
     )
@@ -150,9 +232,11 @@ async def post_poll(channel):
     msg = await channel.send(content=content, embed=embed, allowed_mentions=allowed)
     for emoji, _ in slots:
         await msg.add_reaction(emoji)
+    await msg.add_reaction(FILL_EMOJI)
 
     record_poll_message(channel.guild.id, channel.id, msg.id)
 
+    # Always post a fresh board with the new poll
     if is_matchmaking_enabled(channel.guild.id):
         await post_or_update_board(channel.guild.id, force_new=True)
 
@@ -161,14 +245,18 @@ async def post_poll(channel):
 
 async def post_polls_to_all_servers(reason="scheduled"):
     channels = load_channels()
-    today_str = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
+    today = today_str()
     for guild_id, channel_id in channels.items():
+        # Don't double-post if today's poll already exists for this guild
+        if has_poll_today(guild_id):
+            print(f"[SKIP] Guild {guild_id} already has today's poll.")
+            continue
         channel = bot.get_channel(int(channel_id))
         if channel:
             try:
                 await post_poll(channel)
                 mark_poll_sent(guild_id)
-                print(f"[OK] Posted {reason} poll in guild {guild_id} for {today_str}")
+                print(f"[OK] Posted {reason} poll in guild {guild_id} for {today}")
             except Exception as e:
                 print(f"[ERROR] Failed to post in {channel_id}: {e}")
         else:
@@ -177,22 +265,20 @@ async def post_polls_to_all_servers(reason="scheduled"):
 
 # ─── CATCH-UP CHECK ───────────────────────────────────────────────────────────
 async def check_missed_polls():
-    tz = pytz.timezone(HOST_TZ)
-    today_str = datetime.datetime.now(tz).strftime("%Y-%m-%d")
+    today = today_str()
     channels = load_channels()
     last_polls = load_last_poll_dates()
-    print(f"[CATCH-UP] Today is {today_str}. Found {len(channels)} configured server(s).")
+    print(f"[CATCH-UP] Today is {today}. Found {len(channels)} configured server(s).")
 
     missed_any = False
     for guild_id, channel_id in channels.items():
-        last_date = last_polls.get(str(guild_id))
-        if last_date != today_str:
+        if last_polls.get(str(guild_id)) != today:
             channel = bot.get_channel(int(channel_id))
             if channel:
                 try:
                     await post_poll(channel)
                     mark_poll_sent(guild_id)
-                    print(f"[CATCH-UP] Posted missed poll for guild {guild_id} (last: {last_date or 'never'})")
+                    print(f"[CATCH-UP] Posted missed poll for guild {guild_id}")
                     missed_any = True
                 except Exception as e:
                     print(f"[ERROR] Catch-up failed for {channel_id}: {e}")
@@ -223,41 +309,147 @@ async def daily_poll_loop():
         await post_polls_to_all_servers(reason="scheduled")
 
 
-# ─── AVAILABILITY BOARD ───────────────────────────────────────────────────────
-async def get_full_team_slots(guild_id):
-    poll_messages = load_poll_messages()
-    today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
-    info = poll_messages.get(str(guild_id))
-    if not info or info.get("date") != today:
-        return []
-
+# ─── REACTION ANALYSIS ────────────────────────────────────────────────────────
+async def fetch_today_poll_message(guild_id):
+    info = load_poll_messages().get(str(guild_id))
+    if not info or info.get("date") != today_str():
+        return None
     channel = bot.get_channel(int(info["channel_id"]))
     if not channel:
-        return []
-
+        return None
     try:
-        msg = await channel.fetch_message(int(info["message_id"]))
+        return await channel.fetch_message(int(info["message_id"]))
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        return []
+        return None
 
-    full_slots = []
+
+async def analyze_guild_reactions(guild_id):
+    """
+    Returns a dict describing the poll's reactions:
+      roster_count_per_slot: {emoji: count}  (humans only; everyone who reacted to that slot)
+      fill_marked_user_ids:  set of user IDs who reacted with FILL_EMOJI
+      user_slot_map:         {user_id: set of slot emojis they reacted to}
+    """
+    msg = await fetch_today_poll_message(guild_id)
+    result = {
+        "roster_count_per_slot": {e: 0 for e in EMOJIS},
+        "fill_marked_user_ids": set(),
+        "user_slot_map": {},
+    }
+    if not msg:
+        return result
+
     for reaction in msg.reactions:
         emoji_str = str(reaction.emoji)
-        if emoji_str in EMOJIS and reaction.count >= TEAM_SIZE + 1:
-            full_slots.append(emoji_str)
+        if emoji_str == FILL_EMOJI:
+            async for user in reaction.users():
+                if user.id != bot.user.id:
+                    result["fill_marked_user_ids"].add(user.id)
+        elif emoji_str in EMOJIS:
+            async for user in reaction.users():
+                if user.id == bot.user.id:
+                    continue
+                result["roster_count_per_slot"][emoji_str] += 1
+                result["user_slot_map"].setdefault(user.id, set()).add(emoji_str)
+
+    return result
+
+
+def effective_team_count(guild_id, slot_emoji, raw_roster_count, user_slot_map_for_guild):
+    """
+    Adjusts roster count for a slot based on claims:
+    - Subtract any of OUR fills who got claimed by OTHER teams (they're not playing for us)
+    - Add fills FROM other teams who were claimed BY us (they're playing for us)
+    """
+    count = raw_roster_count
+    today_claims = get_today_claims()
+    for claim in today_claims.get(slot_emoji, []):
+        if claim["fill_home_guild_id"] == str(guild_id) and claim["claimed_by_guild_id"] != str(guild_id):
+            uid = int(claim["fill_user_id"])
+            if slot_emoji in user_slot_map_for_guild.get(uid, set()):
+                count -= 1
+        if claim["claimed_by_guild_id"] == str(guild_id) and claim["fill_home_guild_id"] != str(guild_id):
+            count += 1
+    return count
+
+
+async def get_full_team_slots(guild_id, analysis=None):
+    """Slots where this guild has TEAM_SIZE+ effective players (with claim adjustments)."""
+    if analysis is None:
+        analysis = await analyze_guild_reactions(guild_id)
+    full_slots = []
+    for emoji in EMOJIS:
+        raw = analysis["roster_count_per_slot"][emoji]
+        eff = effective_team_count(guild_id, emoji, raw, analysis["user_slot_map"])
+        if eff >= TEAM_SIZE:
+            full_slots.append(emoji)
     return full_slots
 
 
-async def build_board_embed(viewer_guild_id):
+async def get_available_fills(analyses_by_guild):
+    """
+    Returns {slot_emoji: [fill_info_dicts]} of fills not yet 'consumed' by their home team
+    and not already claimed by some team for this slot.
+    """
+    pool = {emoji: [] for emoji in EMOJIS}
+    today_claims = get_today_claims()
+
+    for gid, analysis in analyses_by_guild.items():
+        guild_obj = bot.get_guild(int(gid))
+        guild_name = guild_obj.name if guild_obj else f"Server {gid}"
+
+        for fill_uid in analysis["fill_marked_user_ids"]:
+            user_slots = analysis["user_slot_map"].get(fill_uid, set())
+            user_name = None
+            if guild_obj:
+                member = guild_obj.get_member(fill_uid)
+                if member:
+                    user_name = member.display_name
+            if not user_name:
+                user_name = f"User {fill_uid}"
+
+            for emoji in user_slots:
+                # Already claimed for this slot? Skip.
+                if is_already_claimed_for_slot(emoji, fill_uid):
+                    continue
+
+                # Home-team-priority: if home team has 5+ at this slot, fill is busy
+                raw = analysis["roster_count_per_slot"][emoji]
+                eff = effective_team_count(gid, emoji, raw, analysis["user_slot_map"])
+                if eff >= TEAM_SIZE:
+                    continue
+
+                pool[emoji].append({
+                    "fill_user_id": str(fill_uid),
+                    "fill_user_name": user_name,
+                    "fill_home_guild_id": str(gid),
+                    "fill_home_guild_name": guild_name,
+                })
+
+    return pool
+
+
+# ─── AVAILABILITY BOARD ───────────────────────────────────────────────────────
+async def build_board_embed_and_react_map(viewer_guild_id):
+    """
+    Returns (embed, react_map) where react_map is {claim_emoji: fill_info}
+    for the fill claim reactions to be added to the message.
+    """
     today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%A, %B %d")
     channels = load_channels()
-    slot_to_teams = {emoji: [] for emoji in EMOJIS}
-    my_full_slots = []
 
+    # Pre-fetch all guild reaction analyses (one round trip per guild)
+    analyses = {}
     for gid in channels.keys():
         if not is_matchmaking_enabled(gid):
             continue
-        full_slots = await get_full_team_slots(gid)
+        analyses[gid] = await analyze_guild_reactions(gid)
+
+    slot_to_teams = {emoji: [] for emoji in EMOJIS}
+    my_full_slots = []
+
+    for gid, analysis in analyses.items():
+        full_slots = await get_full_team_slots(gid, analysis=analysis)
         guild_obj = bot.get_guild(int(gid))
         guild_name = guild_obj.name if guild_obj else f"Server {gid}"
 
@@ -267,6 +459,9 @@ async def build_board_embed(viewer_guild_id):
             for emoji in full_slots:
                 slot_to_teams[emoji].append(guild_name)
 
+    fills_pool = await get_available_fills(analyses)
+
+    # ─── Build the embed ──────────────────────────────────────────────────────
     lines = []
     if my_full_slots:
         my_labels = ", ".join(emoji_to_label(e) for e in my_full_slots)
@@ -276,18 +471,68 @@ async def build_board_embed(viewer_guild_id):
 
     lines.append("")
     lines.append("🌐 **Other teams with 5+ players free tonight:**")
-
     any_others = False
     for emoji in EMOJIS:
         teams = slot_to_teams[emoji]
         if teams:
             any_others = True
-            label = emoji_to_label(emoji)
-            team_list = ", ".join(teams)
-            lines.append(f"• **{label}** — {team_list}")
-
+            lines.append(f"• **{emoji_to_label(emoji)}** — {', '.join(teams)}")
     if not any_others:
-        lines.append("_No other teams have a full 5 yet. Check back as reactions come in!_")
+        lines.append("_No other teams have a full 5 yet._")
+
+    # ─── Fill pool section + claim reactions map ──────────────────────────────
+    lines.append("")
+    lines.append("🆘 **Fills available for any team:**")
+
+    # Show fills already claimed BY this viewer team (so they remember who they have)
+    today_claims = get_today_claims()
+    my_claims_by_slot = {}
+    for emoji, claims in today_claims.items():
+        for c in claims:
+            if c["claimed_by_guild_id"] == str(viewer_guild_id):
+                my_claims_by_slot.setdefault(emoji, []).append(c)
+
+    if my_claims_by_slot:
+        lines.append("**Already claimed by your team:**")
+        for emoji in EMOJIS:
+            for c in my_claims_by_slot.get(emoji, []):
+                lines.append(f"• **{emoji_to_label(emoji)}** — {c['fill_user_name']} ({c['claimed_by_guild_name'] if False else 'from ' + bot.get_guild(int(c['fill_home_guild_id'])).name if bot.get_guild(int(c['fill_home_guild_id'])) else 'unknown'}) ✓ claimed")
+        lines.append("")
+
+    # Build the available list with claim-emoji indices
+    react_map = {}  # claim_emoji -> {slot_emoji, fill_user_id, fill_user_name, fill_home_guild_id, fill_home_guild_name}
+    fill_lines = []
+    claim_idx = 0
+
+    for emoji in EMOJIS:
+        slot_fills = fills_pool[emoji]
+        if not slot_fills:
+            continue
+        fill_lines.append(f"• **{emoji_to_label(emoji)}**")
+        for fill in slot_fills:
+            if claim_idx >= MAX_FILL_REACTIONS:
+                fill_lines.append(f"   _…and more (use_ `/claim @user {emoji_to_label(emoji)}` _to claim)_")
+                break
+            ce = CLAIM_EMOJIS[claim_idx]
+            react_map[ce] = {
+                "slot_emoji": emoji,
+                "fill_user_id": fill["fill_user_id"],
+                "fill_user_name": fill["fill_user_name"],
+                "fill_home_guild_id": fill["fill_home_guild_id"],
+                "fill_home_guild_name": fill["fill_home_guild_name"],
+            }
+            fill_lines.append(f"   {ce}  {fill['fill_user_name']}  ·  _{fill['fill_home_guild_name']}_")
+            claim_idx += 1
+        if claim_idx >= MAX_FILL_REACTIONS:
+            break
+
+    if fill_lines:
+        lines.extend(fill_lines)
+        lines.append("")
+        lines.append("_Managers: click a 🇦/🇧/🇨… reaction below to claim that fill for your team._")
+        lines.append("_Use `/unclaim @user [time]` to release a fill back to the pool._")
+    else:
+        lines.append("_No fills available right now._")
 
     lines.append("")
     lines.append("_DM the team's captain or your contact in their Discord to set up a match._")
@@ -298,11 +543,15 @@ async def build_board_embed(viewer_guild_id):
         description="\n".join(lines),
         color=discord.Color.green(),
     )
-    embed.set_footer(text="Updates live as teams react to today's poll")
-    return embed
+    embed.set_footer(text="Updates live as teams react · Manager-only fill claims")
+    return embed, react_map
 
 
 async def post_or_update_board(guild_id, force_new=False):
+    """
+    Edit the existing board if one exists for today; only post a new one if force_new=True
+    or no board exists yet today.
+    """
     if not is_matchmaking_enabled(guild_id):
         return
 
@@ -310,34 +559,56 @@ async def post_or_update_board(guild_id, force_new=False):
     channel_id = channels.get(str(guild_id))
     if not channel_id:
         return
-
     channel = bot.get_channel(int(channel_id))
     if not channel:
         return
 
-    embed = await build_board_embed(guild_id)
-    today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
+    embed, react_map = await build_board_embed_and_react_map(guild_id)
+    today = today_str()
     boards = load_board_messages()
     info = boards.get(str(guild_id))
 
+    # Try to edit the existing board first
     if info and info.get("date") == today and not force_new:
         try:
             board_channel = bot.get_channel(int(info["channel_id"]))
             if board_channel:
                 msg = await board_channel.fetch_message(int(info["message_id"]))
                 await msg.edit(embed=embed)
+                # Sync claim reactions: add new ones, but don't remove (Discord rate limits make it costly)
+                existing = {str(r.emoji) for r in msg.reactions}
+                for ce in react_map.keys():
+                    if ce not in existing:
+                        try:
+                            await msg.add_reaction(ce)
+                        except discord.HTTPException:
+                            pass
+                # Save the updated react_map for this board
+                all_maps = load_fill_reacts()
+                all_maps[str(guild_id)] = {"date": today, "map": react_map}
+                save_fill_reacts(all_maps)
                 return
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
+            pass  # fall through and post a new one
 
+    # Post a fresh board
     try:
         msg = await channel.send(embed=embed)
         record_board_message(guild_id, channel.id, msg.id)
+        for ce in react_map.keys():
+            try:
+                await msg.add_reaction(ce)
+            except discord.HTTPException:
+                pass
+        all_maps = load_fill_reacts()
+        all_maps[str(guild_id)] = {"date": today, "map": react_map}
+        save_fill_reacts(all_maps)
     except discord.HTTPException as e:
         print(f"[ERROR] Failed to post board for guild {guild_id}: {e}")
 
 
 async def update_all_boards():
+    """Edit (don't repost) the board in every opted-in server."""
     channels = load_channels()
     for gid in channels.keys():
         if is_matchmaking_enabled(gid):
@@ -347,43 +618,212 @@ async def update_all_boards():
                 print(f"[ERROR] Failed to update board for guild {gid}: {e}")
 
 
-# ─── REACTION EVENTS ──────────────────────────────────────────────────────────
+# ─── REACTION EVENT HANDLERS ──────────────────────────────────────────────────
 def is_today_poll_message(payload):
     if not payload.guild_id:
         return False
-    poll_messages = load_poll_messages()
-    today = datetime.datetime.now(pytz.timezone(HOST_TZ)).strftime("%Y-%m-%d")
-    info = poll_messages.get(str(payload.guild_id))
-    if not info or info.get("date") != today:
+    info = load_poll_messages().get(str(payload.guild_id))
+    if not info or info.get("date") != today_str():
         return False
     return str(payload.message_id) == info["message_id"]
+
+
+def is_today_board_message(payload):
+    if not payload.guild_id:
+        return False
+    info = load_board_messages().get(str(payload.guild_id))
+    if not info or info.get("date") != today_str():
+        return False
+    return str(payload.message_id) == info["message_id"]
+
+
+async def notify_fill_claimed(fill_user_id, claiming_guild_name, slot_label):
+    """DM the fill player that they were claimed."""
+    try:
+        user = await bot.fetch_user(int(fill_user_id))
+        await user.send(
+            f"🎮 **You've been claimed as a fill!**\n"
+            f"**{claiming_guild_name}** picked you for **{slot_label}** tonight.\n"
+            f"Reach out to their captain to coordinate."
+        )
+        return True
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return False
+
+
+async def notify_fill_unclaimed(fill_user_id, claiming_guild_name, slot_label):
+    try:
+        user = await bot.fetch_user(int(fill_user_id))
+        await user.send(
+            f"ℹ️ **{claiming_guild_name}** has released your fill claim for **{slot_label}**. "
+            f"You're back in the available pool."
+        )
+        return True
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return False
 
 
 @bot.event
 async def on_raw_reaction_add(payload):
     if payload.user_id == bot.user.id:
         return
-    if not is_today_poll_message(payload):
+
+    # ── Reaction on the daily POLL → refresh boards ──
+    if is_today_poll_message(payload):
+        if str(payload.emoji) in EMOJIS or str(payload.emoji) == FILL_EMOJI:
+            await update_all_boards()
         return
-    if str(payload.emoji) not in EMOJIS:
-        return
-    await update_all_boards()
+
+    # ── Reaction on the BOARD → claim a fill ──
+    if is_today_board_message(payload):
+        emoji_str = str(payload.emoji)
+        if emoji_str not in CLAIM_EMOJIS:
+            return
+
+        guild = bot.get_guild(payload.guild_id)
+        if not guild:
+            return
+        member = guild.get_member(payload.user_id)
+        if not member:
+            try:
+                member = await guild.fetch_member(payload.user_id)
+            except discord.HTTPException:
+                return
+
+        # Permission check: only managers can claim
+        if not member.guild_permissions.manage_guild:
+            try:
+                channel = bot.get_channel(payload.channel_id)
+                msg = await channel.fetch_message(payload.message_id)
+                await msg.remove_reaction(payload.emoji, member)
+            except discord.HTTPException:
+                pass
+            try:
+                await member.send("❌ Only managers (with **Manage Server** permission) can claim fills.")
+            except discord.HTTPException:
+                pass
+            return
+
+        # Look up which fill this emoji corresponds to
+        all_maps = load_fill_reacts()
+        info = all_maps.get(str(payload.guild_id))
+        if not info or info.get("date") != today_str():
+            return
+        react_map = info.get("map", {})
+        fill_info = react_map.get(emoji_str)
+        if not fill_info:
+            return
+
+        slot_emoji = fill_info["slot_emoji"]
+        slot_label = emoji_to_label(slot_emoji)
+
+        # Already claimed by THIS guild for this slot?  (prevent double-claim)
+        existing = is_already_claimed_for_slot(slot_emoji, fill_info["fill_user_id"])
+        if existing and existing["claimed_by_guild_id"] == str(payload.guild_id):
+            return  # already claimed by us, no-op
+        if existing:
+            # Some other guild beat us to it — undo the reaction and tell the manager
+            try:
+                channel = bot.get_channel(payload.channel_id)
+                msg = await channel.fetch_message(payload.message_id)
+                await msg.remove_reaction(payload.emoji, member)
+                await channel.send(
+                    f"⚠️ {member.mention} — that fill was already claimed by **{existing['claimed_by_guild_name']}** for {slot_label}.",
+                    delete_after=10,
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        # Claim it!
+        add_claim(
+            slot_emoji=slot_emoji,
+            fill_user_id=fill_info["fill_user_id"],
+            fill_user_name=fill_info["fill_user_name"],
+            fill_home_guild_id=fill_info["fill_home_guild_id"],
+            claiming_guild_id=str(payload.guild_id),
+            claiming_guild_name=guild.name,
+        )
+
+        # DM the fill
+        dm_ok = await notify_fill_claimed(fill_info["fill_user_id"], guild.name, slot_label)
+
+        # Confirm in channel (deletes after a few seconds to keep things clean)
+        try:
+            channel = bot.get_channel(payload.channel_id)
+            msg_text = f"✅ {member.mention} claimed **{fill_info['fill_user_name']}** ({fill_info['fill_home_guild_name']}) for **{slot_label}**."
+            if not dm_ok:
+                msg_text += f"\n⚠️ Couldn't DM them — please notify directly."
+            await channel.send(msg_text, delete_after=15)
+        except discord.HTTPException:
+            pass
+
+        await update_all_boards()
 
 
 @bot.event
 async def on_raw_reaction_remove(payload):
     if payload.user_id == bot.user.id:
         return
-    if not is_today_poll_message(payload):
+
+    # ── Reaction removed from POLL → refresh boards ──
+    if is_today_poll_message(payload):
+        if str(payload.emoji) in EMOJIS or str(payload.emoji) == FILL_EMOJI:
+            await update_all_boards()
         return
-    if str(payload.emoji) not in EMOJIS:
-        return
-    await update_all_boards()
+
+    # ── Reaction removed from BOARD → unclaim a fill (manager toggling off) ──
+    if is_today_board_message(payload):
+        emoji_str = str(payload.emoji)
+        if emoji_str not in CLAIM_EMOJIS:
+            return
+
+        guild = bot.get_guild(payload.guild_id)
+        if not guild:
+            return
+        member = guild.get_member(payload.user_id)
+        if not member:
+            try:
+                member = await guild.fetch_member(payload.user_id)
+            except discord.HTTPException:
+                return
+
+        if not member.guild_permissions.manage_guild:
+            return
+
+        all_maps = load_fill_reacts()
+        info = all_maps.get(str(payload.guild_id))
+        if not info or info.get("date") != today_str():
+            return
+        react_map = info.get("map", {})
+        fill_info = react_map.get(emoji_str)
+        if not fill_info:
+            return
+
+        slot_emoji = fill_info["slot_emoji"]
+        slot_label = emoji_to_label(slot_emoji)
+
+        # Only unclaim if this guild was the one that claimed it
+        existing = is_already_claimed_for_slot(slot_emoji, fill_info["fill_user_id"])
+        if not existing or existing["claimed_by_guild_id"] != str(payload.guild_id):
+            return
+
+        remove_claim(slot_emoji, fill_info["fill_user_id"], str(payload.guild_id))
+        await notify_fill_unclaimed(fill_info["fill_user_id"], guild.name, slot_label)
+
+        try:
+            channel = bot.get_channel(payload.channel_id)
+            await channel.send(
+                f"↩️ {member.mention} released **{fill_info['fill_user_name']}** for **{slot_label}**.",
+                delete_after=15,
+            )
+        except discord.HTTPException:
+            pass
+
+        await update_all_boards()
 
 
-# ─── HYBRID COMMANDS (both ! and / work) ──────────────────────────────────────
-# hybrid_command = works as !command (prefix) AND /command (slash)
-
+# ─── HYBRID COMMANDS ──────────────────────────────────────────────────────────
 @bot.hybrid_command(name="setchannel", description="Set the current channel for daily scrim polls")
 @commands.has_permissions(manage_guild=True)
 async def setchannel(ctx):
@@ -405,18 +845,19 @@ async def unsetchannel(ctx):
         await ctx.send("This server doesn't have a poll channel set.")
 
 
-@bot.hybrid_command(name="scrim", description="Post a scrim availability poll right now")
+@bot.hybrid_command(name="scrim", description="Post a scrim availability poll right now (only if today doesn't have one)")
 async def scrim(ctx):
-    await ctx.defer()  # acknowledge the slash command (avoids 'interaction failed')
+    await ctx.defer(ephemeral=True)
+    if has_poll_today(ctx.guild.id):
+        await ctx.send(
+            "ℹ️ Today's poll already exists — find it in this channel.\n"
+            "_(The bot only posts one poll per day to keep the board synced.)_",
+            ephemeral=True,
+        )
+        return
     await post_poll(ctx.channel)
     mark_poll_sent(ctx.guild.id)
     await ctx.send("✅ Poll posted!", ephemeral=True)
-    # Try to delete the original ! message if it was a prefix command
-    if ctx.message and ctx.message.author != bot.user:
-        try:
-            await ctx.message.delete()
-        except (discord.Forbidden, discord.NotFound):
-            pass
 
 
 @bot.hybrid_command(name="setping", description="Set a ping (@everyone, @here, or @Role) above each daily poll")
@@ -425,8 +866,7 @@ async def scrim(ctx):
 async def setping(ctx, *, ping: str = None):
     if ping is None:
         await ctx.send(
-            "Usage: `/setping @everyone` or `/setping @here` or `/setping @YourRole`\n"
-            "Use `/unsetping` to remove it.",
+            "Usage: `/setping @everyone` or `/setping @here` or `/setping @YourRole`",
             ephemeral=True,
         )
         return
@@ -442,10 +882,7 @@ async def setping(ctx, *, ping: str = None):
 
     if not valid:
         await ctx.send(
-            "❌ That doesn't look like a valid ping. Use:\n"
-            "• `/setping @everyone`\n"
-            "• `/setping @here`\n"
-            "• `/setping @YourRole` (the role must exist in this server)",
+            "❌ That doesn't look like a valid ping. Use `@everyone`, `@here`, or a role mention.",
             ephemeral=True,
         )
         return
@@ -487,24 +924,103 @@ async def matchmaking(ctx, mode: str = None):
     if mode is None or mode.lower() == "status":
         enabled = is_matchmaking_enabled(gid)
         state = "ON ✅" if enabled else "OFF ❌"
-        await ctx.send(
-            f"**Matchmaking is currently {state}** for this server.\n"
-            f"Use `/matchmaking on` or `/matchmaking off` to change."
-        )
+        await ctx.send(f"**Matchmaking is currently {state}** for this server.")
         return
 
     mode = mode.lower()
     if mode == "on":
         settings[gid] = True
         save_matchmaking_settings(settings)
-        await ctx.send("✅ Matchmaking **enabled**. Your team will appear on other servers' boards when 5+ players react to a slot.")
-        await post_or_update_board(ctx.guild.id, force_new=True)
+        await ctx.send("✅ Matchmaking **enabled**.")
+        await post_or_update_board(ctx.guild.id, force_new=False)
     elif mode == "off":
         settings[gid] = False
         save_matchmaking_settings(settings)
-        await ctx.send("❌ Matchmaking **disabled**. Your team is now hidden from other servers' boards.")
+        await ctx.send("❌ Matchmaking **disabled**.")
     else:
         await ctx.send("Usage: `/matchmaking on`, `/matchmaking off`, or `/matchmaking status`")
+
+
+@bot.hybrid_command(name="claim", description="Claim a fill player for a time slot")
+@app_commands.describe(user="The fill player to claim", time="Time slot, e.g. 8pm or 8:30pm")
+@commands.has_permissions(manage_guild=True)
+async def claim(ctx, user: discord.User, time: str):
+    await ctx.defer(ephemeral=True)
+    slot_emoji = label_to_emoji(time)
+    if not slot_emoji:
+        await ctx.send(f"❌ Couldn't parse time `{time}`. Try `8pm`, `8:30pm`, etc.", ephemeral=True)
+        return
+
+    # Verify they're actually a fill (reacted ✅ + this slot somewhere)
+    found = False
+    fill_home_guild_id = None
+    fill_home_guild_name = None
+    for gid in load_channels().keys():
+        analysis = await analyze_guild_reactions(gid)
+        if user.id in analysis["fill_marked_user_ids"] and slot_emoji in analysis["user_slot_map"].get(user.id, set()):
+            found = True
+            fill_home_guild_id = gid
+            g = bot.get_guild(int(gid))
+            fill_home_guild_name = g.name if g else f"Server {gid}"
+            break
+
+    if not found:
+        await ctx.send(
+            f"❌ {user.display_name} hasn't signed up as a fill for {emoji_to_label(slot_emoji)}.\n"
+            f"_(They need to react ✅ AND the time slot emoji on the daily poll.)_",
+            ephemeral=True,
+        )
+        return
+
+    existing = is_already_claimed_for_slot(slot_emoji, user.id)
+    if existing:
+        await ctx.send(
+            f"⚠️ {user.display_name} is already claimed by **{existing['claimed_by_guild_name']}** for {emoji_to_label(slot_emoji)}.",
+            ephemeral=True,
+        )
+        return
+
+    add_claim(
+        slot_emoji=slot_emoji,
+        fill_user_id=str(user.id),
+        fill_user_name=user.display_name,
+        fill_home_guild_id=fill_home_guild_id,
+        claiming_guild_id=str(ctx.guild.id),
+        claiming_guild_name=ctx.guild.name,
+    )
+    dm_ok = await notify_fill_claimed(user.id, ctx.guild.name, emoji_to_label(slot_emoji))
+    msg = f"✅ Claimed **{user.display_name}** ({fill_home_guild_name}) for **{emoji_to_label(slot_emoji)}**."
+    if not dm_ok:
+        msg += "\n⚠️ Couldn't DM them — please notify directly."
+    await ctx.send(msg, ephemeral=True)
+    await update_all_boards()
+
+
+@bot.hybrid_command(name="unclaim", description="Release a claimed fill back to the pool")
+@app_commands.describe(user="The fill player to release", time="Time slot, e.g. 8pm or 8:30pm")
+@commands.has_permissions(manage_guild=True)
+async def unclaim(ctx, user: discord.User, time: str):
+    await ctx.defer(ephemeral=True)
+    slot_emoji = label_to_emoji(time)
+    if not slot_emoji:
+        await ctx.send(f"❌ Couldn't parse time `{time}`.", ephemeral=True)
+        return
+
+    existing = is_already_claimed_for_slot(slot_emoji, user.id)
+    if not existing:
+        await ctx.send(f"ℹ️ {user.display_name} isn't currently claimed for {emoji_to_label(slot_emoji)}.", ephemeral=True)
+        return
+    if existing["claimed_by_guild_id"] != str(ctx.guild.id):
+        await ctx.send(
+            f"❌ That fill is claimed by **{existing['claimed_by_guild_name']}**, not your team.",
+            ephemeral=True,
+        )
+        return
+
+    remove_claim(slot_emoji, str(user.id), str(ctx.guild.id))
+    await notify_fill_unclaimed(user.id, ctx.guild.name, emoji_to_label(slot_emoji))
+    await ctx.send(f"↩️ Released **{user.display_name}** from **{emoji_to_label(slot_emoji)}**.", ephemeral=True)
+    await update_all_boards()
 
 
 @bot.hybrid_command(name="scrimhelp", description="Show all available scrim bot commands")
@@ -512,20 +1028,23 @@ async def scrimhelp(ctx):
     embed = discord.Embed(
         title="🎮 Scrim Bot Commands",
         description=(
-            "All commands work as both `/command` (slash) and `!command` (prefix).\n\n"
+            "All commands work as `/command` (slash) and `!command` (prefix).\n\n"
             "**Setup (admin only):**\n"
             "• `/setchannel` — Use the current channel for daily polls\n"
             "• `/unsetchannel` — Stop daily polls\n"
-            "• `/setping @Role` — Add a ping above each poll (`@everyone`, `@here`, or `@Role`)\n"
-            "• `/unsetping` — Remove the ping\n"
+            "• `/setping @Role` / `/unsetping` — Add/remove ping above poll\n"
             "• `/matchmaking on/off/status` — Toggle cross-server availability board\n\n"
             "**Anyone:**\n"
-            "• `/scrim` — Post a poll right now\n"
+            "• `/scrim` — Post a poll right now (only if today's poll isn't already up)\n"
             "• `/scrimhelp` — Show this message\n\n"
+            "**Fill claims (admin only):**\n"
+            "• Click 🇦/🇧/🇨… reaction on the board to claim a fill\n"
+            "• Remove the reaction to release them back to the pool\n"
+            "• `/claim @user 8pm` / `/unclaim @user 8pm` — backup commands\n\n"
             f"📅 Daily polls auto-post at **{POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}**.\n"
-            "🌍 Times in the poll show in **each player's local timezone**.\n"
-            f"📋 When your team has **{TEAM_SIZE}+ reactions** on a slot, your server name "
-            "appears on other teams' availability boards (and theirs on yours)."
+            "🌍 Times shown in **each player's local timezone**.\n"
+            f"📋 When your team has **{TEAM_SIZE}+ reactions** on a slot, your server appears on other teams' boards.\n"
+            "✅ React with ✅ on the poll AND time slot(s) to flag yourself as a **fill** for any team."
         ),
         color=discord.Color.blurple(),
     )
@@ -546,19 +1065,14 @@ async def on_command_error(ctx, error):
 @bot.tree.error
 async def on_app_command_error(interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message(
-            "❌ You need the **Manage Server** permission to use this command.",
-            ephemeral=True,
-        )
-    else:
-        print(f"[SLASH ERROR] {error}")
         try:
             await interaction.response.send_message(
-                "❌ Something went wrong. Try again in a moment.",
-                ephemeral=True,
+                "❌ You need the **Manage Server** permission.", ephemeral=True
             )
         except discord.InteractionResponded:
             pass
+    else:
+        print(f"[SLASH ERROR] {error}")
 
 
 @bot.event
@@ -568,15 +1082,13 @@ async def on_ready():
     print(f"Daily poll scheduled for {POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}")
 
 
-# Start the scheduler & sync slash commands
 async def setup_hook():
     bot.loop.create_task(daily_poll_loop())
     try:
         synced = await bot.tree.sync()
         print(f"[SLASH] Synced {len(synced)} slash command(s) globally.")
-        print("[SLASH] Note: global slash commands can take up to 1 hour to appear in all servers.")
     except Exception as e:
-        print(f"[SLASH] Failed to sync slash commands: {e}")
+        print(f"[SLASH] Failed to sync: {e}")
 
 bot.setup_hook = setup_hook
 
