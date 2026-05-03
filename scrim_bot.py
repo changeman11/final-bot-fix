@@ -82,7 +82,12 @@ def label_to_emoji(label):
 intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
+intents.members = True  # needed to resolve usernames for fill players
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Cache of resolved usernames for the current day, so we don't hammer the API
+# Format: {user_id: display_name}
+_username_cache = {}
 
 
 # ─── PERSISTENT STORAGE HELPERS ───────────────────────────────────────────────
@@ -310,6 +315,52 @@ async def daily_poll_loop():
 
 
 # ─── REACTION ANALYSIS ────────────────────────────────────────────────────────
+async def resolve_username(user_id, guild_obj=None):
+    """
+    Best-effort username resolution with multiple fallbacks:
+    1. In-process cache (fastest)
+    2. Guild member cache (if Members Intent is enabled)
+    3. Fetch member from guild API
+    4. Fetch user globally (no guild context)
+    5. Generic fallback
+    """
+    uid = int(user_id)
+    if uid in _username_cache:
+        return _username_cache[uid]
+
+    name = None
+
+    # Try guild member cache first (uses display_name which honours nicknames)
+    if guild_obj:
+        member = guild_obj.get_member(uid)
+        if member:
+            name = member.display_name
+
+    # Fetch from guild API if not cached
+    if not name and guild_obj:
+        try:
+            member = await guild_obj.fetch_member(uid)
+            if member:
+                name = member.display_name
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    # Last resort: global user fetch
+    if not name:
+        try:
+            user = await bot.fetch_user(uid)
+            if user:
+                name = user.display_name or user.name
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    if not name:
+        name = f"User {uid}"
+
+    _username_cache[uid] = name
+    return name
+
+
 async def fetch_today_poll_message(guild_id):
     info = load_poll_messages().get(str(guild_id))
     if not info or info.get("date") != today_str():
@@ -400,13 +451,7 @@ async def get_available_fills(analyses_by_guild):
 
         for fill_uid in analysis["fill_marked_user_ids"]:
             user_slots = analysis["user_slot_map"].get(fill_uid, set())
-            user_name = None
-            if guild_obj:
-                member = guild_obj.get_member(fill_uid)
-                if member:
-                    user_name = member.display_name
-            if not user_name:
-                user_name = f"User {fill_uid}"
+            user_name = await resolve_username(fill_uid, guild_obj)
 
             for emoji in user_slots:
                 # Already claimed for this slot? Skip.
@@ -461,6 +506,28 @@ async def build_board_embed_and_react_map(viewer_guild_id):
 
     fills_pool = await get_available_fills(analyses)
 
+    # ─── Consolidate fills: one entry per unique player, listing ALL slots ───
+    # fills_pool is {slot_emoji: [fill_info, ...]}
+    # We want: {fill_user_id: {info..., "slots": [list of slot_emojis]}}
+    consolidated = {}
+    for slot_emoji, slot_fills in fills_pool.items():
+        for fill in slot_fills:
+            uid = fill["fill_user_id"]
+            if uid not in consolidated:
+                consolidated[uid] = {
+                    "fill_user_id": uid,
+                    "fill_user_name": fill["fill_user_name"],
+                    "fill_home_guild_id": fill["fill_home_guild_id"],
+                    "fill_home_guild_name": fill["fill_home_guild_name"],
+                    "slots": [],
+                }
+            if slot_emoji not in consolidated[uid]["slots"]:
+                consolidated[uid]["slots"].append(slot_emoji)
+
+    # Sort slots within each fill in time order
+    for fill in consolidated.values():
+        fill["slots"].sort(key=lambda e: EMOJIS.index(e))
+
     # ─── Build the embed ──────────────────────────────────────────────────────
     lines = []
     if my_full_slots:
@@ -486,51 +553,62 @@ async def build_board_embed_and_react_map(viewer_guild_id):
 
     # Show fills already claimed BY this viewer team (so they remember who they have)
     today_claims = get_today_claims()
-    my_claims_by_slot = {}
-    for emoji, claims in today_claims.items():
+    my_claims_by_player = {}  # {fill_user_id: {"name", "home_guild_name", "slots": [emoji]}}
+    for slot_emoji, claims in today_claims.items():
         for c in claims:
             if c["claimed_by_guild_id"] == str(viewer_guild_id):
-                my_claims_by_slot.setdefault(emoji, []).append(c)
+                uid = c["fill_user_id"]
+                if uid not in my_claims_by_player:
+                    home_g = bot.get_guild(int(c["fill_home_guild_id"]))
+                    my_claims_by_player[uid] = {
+                        "name": c["fill_user_name"],
+                        "home": home_g.name if home_g else "unknown",
+                        "slots": [],
+                    }
+                if slot_emoji not in my_claims_by_player[uid]["slots"]:
+                    my_claims_by_player[uid]["slots"].append(slot_emoji)
 
-    if my_claims_by_slot:
-        lines.append("**Already claimed by your team:**")
-        for emoji in EMOJIS:
-            for c in my_claims_by_slot.get(emoji, []):
-                lines.append(f"• **{emoji_to_label(emoji)}** — {c['fill_user_name']} ({c['claimed_by_guild_name'] if False else 'from ' + bot.get_guild(int(c['fill_home_guild_id'])).name if bot.get_guild(int(c['fill_home_guild_id'])) else 'unknown'}) ✓ claimed")
+    if my_claims_by_player:
+        lines.append("**✓ Already claimed by your team:**")
+        for uid, info in my_claims_by_player.items():
+            info["slots"].sort(key=lambda e: EMOJIS.index(e))
+            slot_labels = ", ".join(emoji_to_label(e) for e in info["slots"])
+            lines.append(f"• **{info['name']}** _(from {info['home']})_ — {slot_labels}")
         lines.append("")
 
-    # Build the available list with claim-emoji indices
-    react_map = {}  # claim_emoji -> {slot_emoji, fill_user_id, fill_user_name, fill_home_guild_id, fill_home_guild_name}
+    # Build the available list — ONE emoji per UNIQUE PLAYER
+    react_map = {}  # claim_emoji -> {fill_user_id, fill_user_name, fill_home_guild_id, fill_home_guild_name, slots: [emoji]}
     fill_lines = []
     claim_idx = 0
 
-    for emoji in EMOJIS:
-        slot_fills = fills_pool[emoji]
-        if not slot_fills:
-            continue
-        fill_lines.append(f"• **{emoji_to_label(emoji)}**")
-        for fill in slot_fills:
-            if claim_idx >= MAX_FILL_REACTIONS:
-                fill_lines.append(f"   _…and more (use_ `/claim @user {emoji_to_label(emoji)}` _to claim)_")
-                break
-            ce = CLAIM_EMOJIS[claim_idx]
-            react_map[ce] = {
-                "slot_emoji": emoji,
-                "fill_user_id": fill["fill_user_id"],
-                "fill_user_name": fill["fill_user_name"],
-                "fill_home_guild_id": fill["fill_home_guild_id"],
-                "fill_home_guild_name": fill["fill_home_guild_name"],
-            }
-            fill_lines.append(f"   {ce}  {fill['fill_user_name']}  ·  _{fill['fill_home_guild_name']}_")
-            claim_idx += 1
+    # Sort fills by name for consistency
+    sorted_fills = sorted(consolidated.values(), key=lambda f: f["fill_user_name"].lower())
+
+    overflow_count = 0
+    for fill in sorted_fills:
         if claim_idx >= MAX_FILL_REACTIONS:
-            break
+            overflow_count += 1
+            continue
+        ce = CLAIM_EMOJIS[claim_idx]
+        react_map[ce] = {
+            "fill_user_id": fill["fill_user_id"],
+            "fill_user_name": fill["fill_user_name"],
+            "fill_home_guild_id": fill["fill_home_guild_id"],
+            "fill_home_guild_name": fill["fill_home_guild_name"],
+            "slots": fill["slots"],  # list of slot emojis they're available for
+        }
+        slot_labels = ", ".join(emoji_to_label(e) for e in fill["slots"])
+        fill_lines.append(f"{ce}  **{fill['fill_user_name']}** _({fill['fill_home_guild_name']})_ — {slot_labels}")
+        claim_idx += 1
+
+    if overflow_count:
+        fill_lines.append(f"_…and {overflow_count} more (use_ `/claim @user [time]` _to claim those)_")
 
     if fill_lines:
         lines.extend(fill_lines)
         lines.append("")
-        lines.append("_Managers: click a 🇦/🇧/🇨… reaction below to claim that fill for your team._")
-        lines.append("_Use `/unclaim @user [time]` to release a fill back to the pool._")
+        lines.append("_Managers: click 🇦/🇧/🇨… below to claim that fill for **all** their available times._")
+        lines.append("_Use `/unclaim @user [time]` to release a specific time, or remove the reaction to release all times._")
     else:
         lines.append("_No fills available right now._")
 
@@ -549,8 +627,10 @@ async def build_board_embed_and_react_map(viewer_guild_id):
 
 async def post_or_update_board(guild_id, force_new=False):
     """
-    Edit the existing board if one exists for today; only post a new one if force_new=True
-    or no board exists yet today.
+    Edit the existing board if one exists for today; only post a new one if no board
+    exists yet today. Even when force_new=True, we still prefer editing if a board
+    record exists for today — this prevents duplicate boards from redeploys or
+    catch-up logic.
     """
     if not is_matchmaking_enabled(guild_id):
         return
@@ -568,14 +648,15 @@ async def post_or_update_board(guild_id, force_new=False):
     boards = load_board_messages()
     info = boards.get(str(guild_id))
 
-    # Try to edit the existing board first
-    if info and info.get("date") == today and not force_new:
+    # Try to edit the existing board first — even if force_new=True, prefer editing
+    # if today's board exists (defends against duplicate boards on redeploy/catch-up).
+    if info and info.get("date") == today:
         try:
             board_channel = bot.get_channel(int(info["channel_id"]))
             if board_channel:
                 msg = await board_channel.fetch_message(int(info["message_id"]))
                 await msg.edit(embed=embed)
-                # Sync claim reactions: add new ones, but don't remove (Discord rate limits make it costly)
+                # Sync claim reactions: add new ones (don't remove — Discord rate limits)
                 existing = {str(r.emoji) for r in msg.reactions}
                 for ce in react_map.keys():
                     if ce not in existing:
@@ -583,15 +664,14 @@ async def post_or_update_board(guild_id, force_new=False):
                             await msg.add_reaction(ce)
                         except discord.HTTPException:
                             pass
-                # Save the updated react_map for this board
                 all_maps = load_fill_reacts()
                 all_maps[str(guild_id)] = {"date": today, "map": react_map}
                 save_fill_reacts(all_maps)
                 return
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass  # fall through and post a new one
+            pass  # board record stale (msg deleted etc.) — fall through and post fresh
 
-    # Post a fresh board
+    # Post a fresh board (only reached if no board exists today, OR existing one is gone)
     try:
         msg = await channel.send(embed=embed)
         record_board_message(guild_id, channel.id, msg.id)
@@ -714,47 +794,73 @@ async def on_raw_reaction_add(payload):
         if not fill_info:
             return
 
-        slot_emoji = fill_info["slot_emoji"]
-        slot_label = emoji_to_label(slot_emoji)
+        # The new format has "slots" (list) instead of "slot_emoji"
+        target_slots = fill_info.get("slots", [])
+        if not target_slots:
+            # Backwards compatibility: old single-slot format
+            old_slot = fill_info.get("slot_emoji")
+            if old_slot:
+                target_slots = [old_slot]
+        if not target_slots:
+            return
 
-        # Already claimed by THIS guild for this slot?  (prevent double-claim)
-        existing = is_already_claimed_for_slot(slot_emoji, fill_info["fill_user_id"])
-        if existing and existing["claimed_by_guild_id"] == str(payload.guild_id):
-            return  # already claimed by us, no-op
-        if existing:
-            # Some other guild beat us to it — undo the reaction and tell the manager
+        # Try to claim every slot. Some may be already claimed by other guilds.
+        claimed_slots = []
+        skipped_slots = []
+        for slot_emoji in target_slots:
+            existing = is_already_claimed_for_slot(slot_emoji, fill_info["fill_user_id"])
+            if existing:
+                if existing["claimed_by_guild_id"] == str(payload.guild_id):
+                    # Already ours, just skip silently
+                    continue
+                else:
+                    skipped_slots.append((slot_emoji, existing["claimed_by_guild_name"]))
+                    continue
+            add_claim(
+                slot_emoji=slot_emoji,
+                fill_user_id=fill_info["fill_user_id"],
+                fill_user_name=fill_info["fill_user_name"],
+                fill_home_guild_id=fill_info["fill_home_guild_id"],
+                claiming_guild_id=str(payload.guild_id),
+                claiming_guild_name=guild.name,
+            )
+            claimed_slots.append(slot_emoji)
+
+        if not claimed_slots and skipped_slots:
+            # Couldn't claim anything — undo the reaction
             try:
                 channel = bot.get_channel(payload.channel_id)
                 msg = await channel.fetch_message(payload.message_id)
                 await msg.remove_reaction(payload.emoji, member)
+                names = ", ".join(f"{emoji_to_label(s)} ({by})" for s, by in skipped_slots)
                 await channel.send(
-                    f"⚠️ {member.mention} — that fill was already claimed by **{existing['claimed_by_guild_name']}** for {slot_label}.",
-                    delete_after=10,
+                    f"⚠️ {member.mention} — that fill is already claimed for: {names}.",
+                    delete_after=12,
                 )
             except discord.HTTPException:
                 pass
             return
 
-        # Claim it!
-        add_claim(
-            slot_emoji=slot_emoji,
-            fill_user_id=fill_info["fill_user_id"],
-            fill_user_name=fill_info["fill_user_name"],
-            fill_home_guild_id=fill_info["fill_home_guild_id"],
-            claiming_guild_id=str(payload.guild_id),
-            claiming_guild_name=guild.name,
-        )
+        if not claimed_slots:
+            return  # nothing changed
 
-        # DM the fill
-        dm_ok = await notify_fill_claimed(fill_info["fill_user_id"], guild.name, slot_label)
+        # DM the fill once with the full slot list
+        slot_labels = ", ".join(emoji_to_label(s) for s in claimed_slots)
+        dm_ok = await notify_fill_claimed(fill_info["fill_user_id"], guild.name, slot_labels)
 
-        # Confirm in channel (deletes after a few seconds to keep things clean)
+        # Confirm in channel
         try:
             channel = bot.get_channel(payload.channel_id)
-            msg_text = f"✅ {member.mention} claimed **{fill_info['fill_user_name']}** ({fill_info['fill_home_guild_name']}) for **{slot_label}**."
+            msg_text = (
+                f"✅ {member.mention} claimed **{fill_info['fill_user_name']}** "
+                f"({fill_info['fill_home_guild_name']}) for **{slot_labels}**."
+            )
+            if skipped_slots:
+                skip_names = ", ".join(emoji_to_label(s) for s, _ in skipped_slots)
+                msg_text += f"\n_(Note: {skip_names} were already claimed by other teams.)_"
             if not dm_ok:
                 msg_text += f"\n⚠️ Couldn't DM them — please notify directly."
-            await channel.send(msg_text, delete_after=15)
+            await channel.send(msg_text, delete_after=20)
         except discord.HTTPException:
             pass
 
@@ -800,21 +906,30 @@ async def on_raw_reaction_remove(payload):
         if not fill_info:
             return
 
-        slot_emoji = fill_info["slot_emoji"]
-        slot_label = emoji_to_label(slot_emoji)
+        # New format: release ALL slots this guild had claimed for this player
+        target_slots = fill_info.get("slots", [])
+        if not target_slots:
+            old_slot = fill_info.get("slot_emoji")
+            if old_slot:
+                target_slots = [old_slot]
 
-        # Only unclaim if this guild was the one that claimed it
-        existing = is_already_claimed_for_slot(slot_emoji, fill_info["fill_user_id"])
-        if not existing or existing["claimed_by_guild_id"] != str(payload.guild_id):
+        released_slots = []
+        for slot_emoji in target_slots:
+            existing = is_already_claimed_for_slot(slot_emoji, fill_info["fill_user_id"])
+            if existing and existing["claimed_by_guild_id"] == str(payload.guild_id):
+                remove_claim(slot_emoji, fill_info["fill_user_id"], str(payload.guild_id))
+                released_slots.append(slot_emoji)
+
+        if not released_slots:
             return
 
-        remove_claim(slot_emoji, fill_info["fill_user_id"], str(payload.guild_id))
-        await notify_fill_unclaimed(fill_info["fill_user_id"], guild.name, slot_label)
+        slot_labels = ", ".join(emoji_to_label(s) for s in released_slots)
+        await notify_fill_unclaimed(fill_info["fill_user_id"], guild.name, slot_labels)
 
         try:
             channel = bot.get_channel(payload.channel_id)
             await channel.send(
-                f"↩️ {member.mention} released **{fill_info['fill_user_name']}** for **{slot_label}**.",
+                f"↩️ {member.mention} released **{fill_info['fill_user_name']}** from **{slot_labels}**.",
                 delete_after=15,
             )
         except discord.HTTPException:
@@ -1023,6 +1138,131 @@ async def unclaim(ctx, user: discord.User, time: str):
     await update_all_boards()
 
 
+@bot.hybrid_command(name="refreshboard", description="Delete and recreate the availability board (admin)")
+@commands.has_permissions(manage_guild=True)
+async def refreshboard(ctx):
+    """Nukes today's board record + recreates it fresh. Useful if the board got duplicated or stale."""
+    await ctx.defer(ephemeral=True)
+
+    # Find and delete ALL bot messages today that look like a board
+    channels = load_channels()
+    channel_id = channels.get(str(ctx.guild.id))
+    if not channel_id:
+        await ctx.send("❌ This server doesn't have a poll channel set. Run `/setchannel` first.", ephemeral=True)
+        return
+
+    channel = bot.get_channel(int(channel_id))
+    if not channel:
+        await ctx.send("❌ Couldn't find your poll channel.", ephemeral=True)
+        return
+
+    # Delete tracked board message if it exists
+    boards = load_board_messages()
+    info = boards.get(str(ctx.guild.id))
+    if info and info.get("date") == today_str():
+        try:
+            old_msg = await channel.fetch_message(int(info["message_id"]))
+            await old_msg.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    # Also scan recent messages for any other board-shaped messages from the bot today
+    deleted_count = 0
+    try:
+        async for m in channel.history(limit=50):
+            if m.author == bot.user and m.embeds:
+                title = m.embeds[0].title or ""
+                if title.startswith("📋 Live Scrim Availability"):
+                    try:
+                        await m.delete()
+                        deleted_count += 1
+                    except discord.HTTPException:
+                        pass
+    except discord.HTTPException:
+        pass
+
+    # Clear board record
+    boards.pop(str(ctx.guild.id), None)
+    save_board_messages(boards)
+
+    # Post a fresh one
+    if is_matchmaking_enabled(ctx.guild.id):
+        await post_or_update_board(ctx.guild.id, force_new=True)
+
+    await ctx.send(f"✅ Refreshed availability board (cleaned up {deleted_count} old message(s)).", ephemeral=True)
+
+
+@bot.hybrid_command(name="refreshpoll", description="Delete and recreate today's poll (admin) — use sparingly!")
+@commands.has_permissions(manage_guild=True)
+async def refreshpoll(ctx):
+    """Nukes today's poll + board, then recreates them. WARNING: erases all reactions/signups."""
+    await ctx.defer(ephemeral=True)
+
+    channels = load_channels()
+    channel_id = channels.get(str(ctx.guild.id))
+    if not channel_id:
+        await ctx.send("❌ This server doesn't have a poll channel set. Run `/setchannel` first.", ephemeral=True)
+        return
+
+    channel = bot.get_channel(int(channel_id))
+    if not channel:
+        await ctx.send("❌ Couldn't find your poll channel.", ephemeral=True)
+        return
+
+    # Delete tracked poll message
+    poll_msgs = load_poll_messages()
+    info = poll_msgs.get(str(ctx.guild.id))
+    if info and info.get("date") == today_str():
+        try:
+            old = await channel.fetch_message(int(info["message_id"]))
+            await old.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    # Scan recent messages for any other poll-shaped messages from bot today
+    poll_deleted = 0
+    board_deleted = 0
+    try:
+        async for m in channel.history(limit=50):
+            if m.author == bot.user and m.embeds:
+                title = m.embeds[0].title or ""
+                if title.startswith("📅 Scrim Availability"):
+                    try:
+                        await m.delete()
+                        poll_deleted += 1
+                    except discord.HTTPException:
+                        pass
+                elif title.startswith("📋 Live Scrim Availability"):
+                    try:
+                        await m.delete()
+                        board_deleted += 1
+                    except discord.HTTPException:
+                        pass
+    except discord.HTTPException:
+        pass
+
+    # Clear records
+    poll_msgs.pop(str(ctx.guild.id), None)
+    save_poll_messages(poll_msgs)
+    boards = load_board_messages()
+    boards.pop(str(ctx.guild.id), None)
+    save_board_messages(boards)
+
+    # Clear today's "poll sent" mark so the bot will repost
+    last_polls = load_last_poll_dates()
+    last_polls.pop(str(ctx.guild.id), None)
+    save_last_poll_dates(last_polls)
+
+    # Repost
+    await post_poll(channel)
+    mark_poll_sent(ctx.guild.id)
+
+    await ctx.send(
+        f"✅ Refreshed today's poll (cleaned up {poll_deleted} poll(s) + {board_deleted} board(s)).",
+        ephemeral=True,
+    )
+
+
 @bot.hybrid_command(name="scrimhelp", description="Show all available scrim bot commands")
 async def scrimhelp(ctx):
     embed = discord.Embed(
@@ -1038,9 +1278,12 @@ async def scrimhelp(ctx):
             "• `/scrim` — Post a poll right now (only if today's poll isn't already up)\n"
             "• `/scrimhelp` — Show this message\n\n"
             "**Fill claims (admin only):**\n"
-            "• Click 🇦/🇧/🇨… reaction on the board to claim a fill\n"
+            "• Click 🇦/🇧/🇨… reaction on the board to claim a fill (claims ALL their times)\n"
             "• Remove the reaction to release them back to the pool\n"
-            "• `/claim @user 8pm` / `/unclaim @user 8pm` — backup commands\n\n"
+            "• `/claim @user 8pm` / `/unclaim @user 8pm` — backup commands (per-slot)\n\n"
+            "**Reset (admin only — use sparingly):**\n"
+            "• `/refreshboard` — Delete & recreate the availability board\n"
+            "• `/refreshpoll` — Delete & recreate today's poll (erases reactions!)\n\n"
             f"📅 Daily polls auto-post at **{POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}**.\n"
             "🌍 Times shown in **each player's local timezone**.\n"
             f"📋 When your team has **{TEAM_SIZE}+ reactions** on a slot, your server appears on other teams' boards.\n"
@@ -1080,6 +1323,20 @@ async def on_ready():
     print(f"Logged in as {bot.user} — serving {len(bot.guilds)} servers")
     print(f"Data directory: {DATA_DIR}")
     print(f"Daily poll scheduled for {POLL_HOUR:02d}:{POLL_MIN:02d} {HOST_TZ}")
+
+    # Verify Members Intent is actually working (helps diagnose username issues)
+    members_intent_active = bot.intents.members
+    if members_intent_active:
+        # Check if we actually got members in any guild
+        total_members_cached = sum(len(g.members) for g in bot.guilds)
+        if total_members_cached < 2 and bot.guilds:
+            print("[WARN] Members Intent is enabled in code but no members are cached.")
+            print("[WARN] You may need to enable 'Server Members Intent' in the Discord Developer Portal:")
+            print("[WARN]   https://discord.com/developers/applications → Bot → Privileged Gateway Intents")
+        else:
+            print(f"[OK] Members Intent active. Cached {total_members_cached} members across all servers.")
+    else:
+        print("[WARN] Members Intent is OFF in code — usernames will fall back to user IDs.")
 
 
 async def setup_hook():
